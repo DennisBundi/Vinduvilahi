@@ -1,0 +1,817 @@
+'use client';
+
+import { useState, useMemo, useEffect } from 'react';
+import Link from 'next/link';
+
+interface Order {
+  id: string;
+  order_number?: string;
+  customer: string;
+  email: string;
+  seller: string;
+  seller_role?: string | null;
+  type: string;
+  amount: number;
+  commission?: number;
+  status: string;
+  date: Date;
+  payment_method: string;
+}
+
+export default function OrdersPage() {
+  const [orders, setOrders] = useState<Order[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedStatus, setSelectedStatus] = useState('all');
+  const [selectedType, setSelectedType] = useState('all');
+  const [userRole, setUserRole] = useState<string | null>(null);
+  const [deletingOrderId, setDeletingOrderId] = useState<string | null>(null);
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [orderToDelete, setOrderToDelete] = useState<Order | null>(null);
+  const [lastPaymentDate, setLastPaymentDate] = useState<Date | null>(null);
+  const [totalCommission, setTotalCommission] = useState<number>(0);
+  
+  // Date filter state (only for admins/managers)
+  const [dateFilter, setDateFilter] = useState<string>('all');
+  const [customStartDate, setCustomStartDate] = useState<string>('');
+  const [customEndDate, setCustomEndDate] = useState<string>('');
+
+  // Bulk delete state (admin only)
+  const [selectedOrderIds, setSelectedOrderIds] = useState<Set<string>>(new Set());
+  const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
+  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
+
+  useEffect(() => {
+    fetchUserRole();
+  }, []);
+
+  useEffect(() => {
+    if (userRole) {
+      // Set default date filter based on role
+      if (userRole === 'seller') {
+        setDateFilter('today');
+      }
+    }
+  }, [userRole]);
+
+  useEffect(() => {
+    if (userRole) {
+      // Only fetch if custom date range has both dates, or if not using custom filter
+      if (dateFilter !== 'custom' || (customStartDate && customEndDate)) {
+        fetchOrders();
+      }
+      if (userRole === 'seller') {
+        fetchUserStats();
+      }
+    }
+  }, [userRole, dateFilter, customStartDate, customEndDate]);
+
+  const fetchUserRole = async () => {
+    try {
+      const response = await fetch('/api/auth/role');
+      const { role } = await response.json();
+      setUserRole(role);
+    } catch (error) {
+      console.error('Error fetching user role:', error);
+    }
+  };
+
+  const fetchUserStats = async () => {
+    try {
+      // Fetch user stats which includes last_commission_payment_date and totalCommission
+      const response = await fetch('/api/dashboard/user-stats');
+      if (response.ok) {
+        const data = await response.json();
+        setTotalCommission(data.totalCommission || 0);
+        if (data.lastCommissionPaymentDate) {
+          setLastPaymentDate(new Date(data.lastCommissionPaymentDate));
+        }
+      }
+    } catch (error) {
+      console.error('Error fetching user stats:', error);
+    }
+  };
+
+  const fetchOrders = async () => {
+    try {
+      setLoading(true);
+      setError(null);
+      
+      // Build query parameters
+      const params = new URLSearchParams();
+      if (userRole !== 'seller') {
+        // Only add date filter for admins/managers
+        if (dateFilter && dateFilter !== 'all') {
+          params.append('dateFilter', dateFilter);
+        }
+        if (dateFilter === 'custom' && customStartDate && customEndDate) {
+          params.append('startDate', customStartDate);
+          params.append('endDate', customEndDate);
+        }
+      }
+      
+      const response = await fetch(`/api/orders?${params.toString()}`);
+      const data = await response.json();
+      
+      if (!response.ok) {
+        // Show detailed error message from API
+        const errorMessage = data.details 
+          ? `${data.error}: ${data.details}`
+          : data.error || 'Failed to fetch orders';
+        throw new Error(errorMessage);
+      }
+      
+      // Transform dates from strings to Date objects
+      const ordersWithDates = (data.orders || []).map((order: any) => ({
+        ...order,
+        date: order.date ? (order.date instanceof Date ? order.date : new Date(order.date)) : new Date(),
+      }));
+      
+      setOrders(ordersWithDates);
+    } catch (err) {
+      console.error('Error fetching orders:', err);
+      setError(err instanceof Error ? err.message : 'Failed to load orders');
+      setOrders([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Calculate date range based on filter
+  const getDateRange = useMemo(() => {
+    const now = new Date();
+    
+    if (userRole === 'seller' || dateFilter === 'today') {
+      const todayStart = new Date(now);
+      todayStart.setHours(0, 0, 0, 0);
+      const todayEnd = new Date(now);
+      todayEnd.setHours(23, 59, 59, 999);
+      return { start: todayStart, end: todayEnd, label: 'Today' };
+    } else if (dateFilter === 'week') {
+      const weekStart = new Date(now);
+      weekStart.setDate(now.getDate() - now.getDay());
+      weekStart.setHours(0, 0, 0, 0);
+      return { start: weekStart, end: now, label: 'This Week' };
+    } else if (dateFilter === 'month') {
+      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+      return { start: monthStart, end: now, label: 'This Month' };
+    } else if (dateFilter === 'custom' && customStartDate && customEndDate) {
+      const start = new Date(customStartDate);
+      start.setHours(0, 0, 0, 0);
+      const end = new Date(customEndDate);
+      end.setHours(23, 59, 59, 999);
+      return { start, end, label: 'Custom Range' };
+    }
+    
+    // 'all' or no filter - return null to indicate all time
+    return null;
+  }, [dateFilter, customStartDate, customEndDate, userRole]);
+
+  // Filter orders for stats based on date range (for display purposes)
+  // Note: The API already filters orders, so this is mainly for consistency
+  const filteredOrdersForStats = useMemo(() => {
+    if (!getDateRange) {
+      // Show all orders
+      return orders;
+    }
+    return orders.filter((order) => {
+      const orderDate = new Date(order.date);
+      return orderDate >= getDateRange.start && orderDate <= getDateRange.end;
+    });
+  }, [orders, getDateRange]);
+
+  // Commission is fetched from user-stats API which compounds from last_payment_date until now
+  // This includes all completed orders after last payment date (not limited to today)
+
+  // Clear selection when filters change
+  useEffect(() => {
+    setSelectedOrderIds(new Set());
+  }, [searchQuery, selectedStatus, selectedType, dateFilter, customStartDate, customEndDate]);
+
+  // Filter orders based on search, status, and type (for table display)
+  const filteredOrders = useMemo(() => {
+    return orders.filter((order) => {
+      const searchLower = searchQuery.toLowerCase();
+      const matchesSearch = 
+        order.id.toLowerCase().includes(searchLower) ||
+        (order.order_number && order.order_number.toLowerCase().includes(searchLower)) ||
+        order.customer.toLowerCase().includes(searchLower) ||
+        order.email.toLowerCase().includes(searchLower);
+      const matchesStatus = selectedStatus === 'all' || order.status === selectedStatus;
+      const matchesType = selectedType === 'all' || order.type === selectedType;
+      return matchesSearch && matchesStatus && matchesType;
+    });
+  }, [orders, searchQuery, selectedStatus, selectedType]);
+
+  const handleDeleteClick = (order: Order) => {
+    setOrderToDelete(order);
+    setShowDeleteModal(true);
+  };
+
+  const handleDeleteConfirm = async () => {
+    if (!orderToDelete) return;
+
+    setDeletingOrderId(orderToDelete.id);
+    try {
+      const response = await fetch(`/api/orders?id=${orderToDelete.id}`, {
+        method: 'DELETE',
+      });
+
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(data.error || 'Failed to delete order');
+      }
+
+      // Remove order from state
+      setOrders(orders.filter((o) => o.id !== orderToDelete.id));
+      setShowDeleteModal(false);
+      setOrderToDelete(null);
+    } catch (err) {
+      console.error('Error deleting order:', err);
+      alert(err instanceof Error ? err.message : 'Failed to delete order. Please try again.');
+    } finally {
+      setDeletingOrderId(null);
+    }
+  };
+
+  const handleDeleteCancel = () => {
+    setShowDeleteModal(false);
+    setOrderToDelete(null);
+  };
+
+  const handleSelectOrder = (orderId: string, checked: boolean) => {
+    setSelectedOrderIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(orderId);
+      else next.delete(orderId);
+      return next;
+    });
+  };
+
+  const handleSelectAll = (checked: boolean) => {
+    if (checked) {
+      setSelectedOrderIds(new Set(filteredOrders.map((o) => o.id)));
+    } else {
+      setSelectedOrderIds(new Set());
+    }
+  };
+
+  const handleBulkDeleteConfirm = async () => {
+    if (selectedOrderIds.size === 0) return;
+    setIsBulkDeleting(true);
+    const ids = Array.from(selectedOrderIds);
+    let failCount = 0;
+    const deletedIds: string[] = [];
+
+    try {
+      for (const id of ids) {
+        try {
+          const response = await fetch(`/api/orders?id=${id}`, { method: 'DELETE' });
+          if (response.ok) {
+            deletedIds.push(id);
+          } else {
+            failCount++;
+          }
+        } catch {
+          failCount++;
+        }
+      }
+
+      setOrders((prev) => prev.filter((o) => !deletedIds.includes(o.id)));
+      setSelectedOrderIds(new Set());
+      setShowBulkDeleteModal(false);
+
+      if (failCount > 0) {
+        alert(`${deletedIds.length} order(s) deleted. ${failCount} failed — please try again.`);
+      }
+    } finally {
+      setIsBulkDeleting(false);
+    }
+  };
+
+  return (
+    <div className="space-y-6 animate-fade-in">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-white mb-1">Orders</h1>
+          <p className="text-sm text-white/50">
+            {userRole === 'seller' 
+              ? "Today's orders only • Manage and track customer orders"
+              : "All orders • Filter by date to view specific periods"}
+          </p>
+        </div>
+      </div>
+
+      {/* Stats Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div className="glass-card p-5">
+          <div className="text-xs text-white/60 mb-2">
+            Total Orders {userRole !== 'seller' && getDateRange ? `(${getDateRange.label})` : '(Today)'}
+          </div>
+          {loading ? (
+            <div className="text-2xl font-bold text-white/40">...</div>
+          ) : (
+            <>
+              <div className="text-2xl font-bold text-white">
+                {filteredOrdersForStats.length}
+              </div>
+              <div className="text-xs text-white/50 mt-1">
+                {userRole === 'seller' ? 'Today only' : getDateRange ? getDateRange.label : 'All time'}
+              </div>
+            </>
+          )}
+        </div>
+        <div className="glass-card p-5">
+          <div className="text-xs text-white/60 mb-2">
+            Completed {userRole !== 'seller' && getDateRange ? `(${getDateRange.label})` : '(Today)'}
+          </div>
+          {loading ? (
+            <div className="text-2xl font-bold text-white/40">...</div>
+          ) : (
+            <div className="text-2xl font-bold text-green-300">
+              {filteredOrdersForStats.filter(o => o.status === 'completed').length}
+            </div>
+          )}
+        </div>
+        <div className="glass-card p-5">
+          <div className="text-xs text-white/60 mb-2">
+            Pending {userRole !== 'seller' && getDateRange ? `(${getDateRange.label})` : '(Today)'}
+          </div>
+          {loading ? (
+            <div className="text-2xl font-bold text-white/40">...</div>
+          ) : (
+            <div className="text-2xl font-bold text-yellow-300">
+              {filteredOrdersForStats.filter(o => o.status === 'pending').length}
+            </div>
+          )}
+        </div>
+        <div className="glass-card p-5">
+          <div className="text-xs text-white/60 mb-2">
+            {userRole === 'seller' ? 'Total Commission' : 'Total Revenue'}
+            {userRole !== 'seller' && getDateRange ? ` (${getDateRange.label})` : ''}
+          </div>
+          {loading ? (
+            <div className="text-2xl font-bold text-white/40">...</div>
+          ) : (
+            <div className="text-2xl font-bold text-primary">
+              KES {userRole === 'seller'
+                ? totalCommission.toLocaleString()
+                : (filteredOrdersForStats
+                    .filter(o => o.status === 'completed')
+                    .reduce((sum, o) => sum + (o.amount || 0), 0) || 0).toLocaleString()}
+            </div>
+          )}
+          {userRole === 'seller' ? (
+            <div className="text-xs text-white/50 mt-1">3% commission • Compounded from last payment</div>
+          ) : (
+            <div className="text-xs text-white/50 mt-1">
+              {getDateRange ? getDateRange.label : 'All time'}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Filters */}
+      <div className="glass-card p-5">
+        <div className="flex flex-col md:flex-row gap-3">
+          <input
+            type="text"
+            placeholder="Search orders by ID, customer, or email..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="flex-1 px-3 py-2 text-sm bg-white/10 border border-white/20 text-white rounded-lg focus:outline-none focus:border-rose-400/50 focus:ring-2 focus:ring-rose-400/20 focus:bg-white/15"
+          />
+
+          {/* Date Filter - Only show for admins/managers */}
+          {userRole !== 'seller' && (
+            <>
+              <select
+                value={dateFilter}
+                onChange={(e) => {
+                  setDateFilter(e.target.value);
+                  if (e.target.value !== 'custom') {
+                    setCustomStartDate('');
+                    setCustomEndDate('');
+                  }
+                }}
+                className="px-3 py-2 text-sm bg-white/10 border border-white/20 text-white rounded-lg focus:outline-none focus:border-rose-400/50 focus:ring-2 focus:ring-rose-400/20 focus:bg-white/15"
+              >
+                <option value="all">All Time</option>
+                <option value="today">Today</option>
+                <option value="week">This Week</option>
+                <option value="month">This Month</option>
+                <option value="custom">Custom Range</option>
+              </select>
+
+              {dateFilter === 'custom' && (
+                <>
+                  <input
+                    type="date"
+                    value={customStartDate}
+                    onChange={(e) => setCustomStartDate(e.target.value)}
+                    className="px-3 py-2 text-sm bg-white/10 border border-white/20 text-white rounded-lg focus:outline-none focus:border-rose-400/50 focus:ring-2 focus:ring-rose-400/20 focus:bg-white/15"
+                    placeholder="Start Date"
+                  />
+                  <input
+                    type="date"
+                    value={customEndDate}
+                    onChange={(e) => setCustomEndDate(e.target.value)}
+                    className="px-3 py-2 text-sm bg-white/10 border border-white/20 text-white rounded-lg focus:outline-none focus:border-rose-400/50 focus:ring-2 focus:ring-rose-400/20 focus:bg-white/15"
+                    placeholder="End Date"
+                  />
+                </>
+              )}
+            </>
+          )}
+
+          <select
+            value={selectedStatus}
+            onChange={(e) => setSelectedStatus(e.target.value)}
+            className="px-3 py-2 text-sm bg-white/10 border border-white/20 text-white rounded-lg focus:outline-none focus:border-rose-400/50 focus:ring-2 focus:ring-rose-400/20 focus:bg-white/15"
+          >
+            <option value="all">All Status</option>
+            <option value="completed">Completed</option>
+            <option value="pending">Pending</option>
+            <option value="processing">Processing</option>
+          </select>
+          <select
+            value={selectedType}
+            onChange={(e) => setSelectedType(e.target.value)}
+            className="px-3 py-2 text-sm bg-white/10 border border-white/20 text-white rounded-lg focus:outline-none focus:border-rose-400/50 focus:ring-2 focus:ring-rose-400/20 focus:bg-white/15"
+          >
+            <option value="all">All Types</option>
+            <option value="online">Online</option>
+            <option value="pos">POS</option>
+          </select>
+        </div>
+        <div className="mt-3 text-xs text-white/50">
+          {filteredOrders.length !== orders.length 
+            ? `Showing ${filteredOrders.length} of ${orders.length} orders${userRole !== 'seller' && getDateRange ? ` (${getDateRange.label})` : ' (today)'}`
+            : `Showing all ${orders.length} orders${userRole !== 'seller' && getDateRange ? ` (${getDateRange.label})` : ' from today'}`}
+        </div>
+      </div>
+
+      {/* Bulk Action Bar — admin only, visible when orders are selected */}
+      {userRole === 'admin' && selectedOrderIds.size > 0 && (
+        <div className="flex items-center justify-between bg-red-500/10 border border-red-400/20 rounded-xl px-4 py-3">
+          <span className="text-sm font-medium text-red-300">
+            {selectedOrderIds.size} order{selectedOrderIds.size !== 1 ? 's' : ''} selected
+          </span>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setSelectedOrderIds(new Set())}
+              className="text-sm text-white/50 hover:text-white transition-colors"
+            >
+              Clear selection
+            </button>
+            <button
+              onClick={() => setShowBulkDeleteModal(true)}
+              disabled={isBulkDeleting}
+              className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white text-sm font-semibold rounded-lg hover:bg-red-700 transition-colors disabled:opacity-50"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+              </svg>
+              Delete {selectedOrderIds.size} Order{selectedOrderIds.size !== 1 ? 's' : ''}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Orders Table */}
+      <div className="backdrop-blur-md bg-black/30 border border-white/10 rounded-2xl overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead className="bg-black/20 border-b border-white/10">
+              <tr>
+                    {userRole === 'admin' && (
+                      <th className="px-4 py-3 w-10">
+                        <input
+                          type="checkbox"
+                          className="rounded border-gray-300 text-primary focus:ring-primary"
+                          checked={filteredOrders.length > 0 && selectedOrderIds.size === filteredOrders.length}
+                          ref={(el) => {
+                            if (el) el.indeterminate = selectedOrderIds.size > 0 && selectedOrderIds.size < filteredOrders.length;
+                          }}
+                          onChange={(e) => handleSelectAll(e.target.checked)}
+                          disabled={filteredOrders.length === 0}
+                        />
+                      </th>
+                    )}
+                <th className="px-4 py-3 text-left text-xs font-medium text-white/60">Order ID</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-white/60">Customer</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-white/60">Seller</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-white/60">Type</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-white/60">
+                  {userRole === 'seller' ? 'Commission' : 'Amount'}
+                </th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-white/60">Payment</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-white/60">Status</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-white/60">Date</th>
+                <th className="px-4 py-3 text-center text-xs font-medium text-white/60">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-white/10">
+              {loading ? (
+                <tr>
+                  <td colSpan={userRole === 'admin' ? 10 : userRole === 'seller' ? 8 : 9} className="px-4 py-8 text-center">
+                    <div className="flex items-center justify-center">
+                      <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-primary"></div>
+                      <span className="ml-2 text-xs text-white/60">Loading orders...</span>
+                    </div>
+                  </td>
+                </tr>
+              ) : error ? (
+                <tr>
+                  <td colSpan={userRole === 'admin' ? 10 : userRole === 'seller' ? 8 : 9} className="px-4 py-8 text-center">
+                    <div className="text-red-500">
+                      <svg className="w-10 h-10 mx-auto mb-3 text-red-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                      <p className="text-sm font-medium">Error loading orders</p>
+                      <p className="text-xs mt-1">{error}</p>
+                      <button
+                        onClick={fetchOrders}
+                        className="mt-3 px-3 py-1.5 text-xs bg-primary text-white rounded-lg hover:bg-primary-dark transition-colors"
+                      >
+                        Retry
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ) : filteredOrders.length === 0 ? (
+                <tr>
+                  <td colSpan={userRole === 'admin' ? 10 : userRole === 'seller' ? 8 : 9} className="px-4 py-8 text-center">
+                    <div className="text-white/50">
+                      <svg className="w-10 h-10 mx-auto mb-3 text-white/20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                      </svg>
+                      <p className="text-sm font-medium">No orders found</p>
+                      <p className="text-xs mt-1">
+                        {orders.length === 0
+                          ? 'No orders for today yet'
+                          : 'Try adjusting your filters'}
+                      </p>
+                    </div>
+                  </td>
+                </tr>
+              ) : (
+                filteredOrders.map((order) => (
+                <tr
+                  key={order.id}
+                  className={`hover:bg-white/5 transition-colors ${selectedOrderIds.has(order.id) ? 'bg-red-500/10' : ''}`}
+                >
+                  {userRole === 'admin' && (
+                    <td className="px-4 py-3">
+                      <input
+                        type="checkbox"
+                        className="rounded border-gray-300 text-primary focus:ring-primary"
+                        checked={selectedOrderIds.has(order.id)}
+                        onChange={(e) => handleSelectOrder(order.id, e.target.checked)}
+                        disabled={isBulkDeleting}
+                      />
+                    </td>
+                  )}
+                  <td className="px-4 py-3">
+                    <div className="font-mono text-xs font-semibold text-white">
+                      {order.order_number || order.id}
+                    </div>
+                    <div className="text-xs text-white/40 mt-0.5">ID: {order.id.slice(0, 8)}...</div>
+                  </td>
+                  <td className="px-4 py-3">
+                    <div>
+                      <div className="text-sm font-medium text-white">{order.customer}</div>
+                      <div className="text-xs text-white/50">{order.email}</div>
+                    </div>
+                  </td>
+                  <td className="px-4 py-3">
+                    <span className="text-xs text-white/60">{order.seller}</span>
+                  </td>
+                  <td className="px-4 py-3">
+                    <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-blue-500/20 text-blue-300 uppercase">
+                      {order.type}
+                    </span>
+                  </td>
+                  {userRole === 'seller' ? (
+                    <td className="px-4 py-3">
+                      <span className="font-semibold text-primary">
+                        KES {(order.commission || 0).toLocaleString()}
+                      </span>
+                      <div className="text-xs text-white/50 mt-0.5">
+                        from KES {(order.amount || 0).toLocaleString()}
+                      </div>
+                    </td>
+                  ) : (
+                    <td className="px-4 py-3">
+                      <span className="font-semibold text-white">
+                        KES {(order.amount || 0).toLocaleString()}
+                      </span>
+                      {order.seller_role === 'admin' ? (
+                        <div className="text-xs text-white/50 mt-0.5">
+                          Commission: <span className="text-white/40">N/A</span>
+                        </div>
+                      ) : order.commission && order.commission > 0 ? (
+                        <div className="text-xs text-white/50 mt-0.5">
+                          Commission: KES {(order.commission || 0).toLocaleString()}
+                        </div>
+                      ) : null}
+                    </td>
+                  )}
+                  <td className="px-4 py-3">
+                    <span className="text-xs text-white/60 capitalize">{order.payment_method}</span>
+                  </td>
+                  <td className="px-4 py-3">
+                    <span
+                      className={`px-2 py-0.5 rounded-full text-xs font-medium ${
+                        order.status === 'completed'
+                          ? 'bg-green-500/20 text-green-300'
+                          : order.status === 'pending'
+                          ? 'bg-yellow-500/20 text-yellow-300'
+                          : 'bg-blue-500/20 text-blue-300'
+                      }`}
+                    >
+                      {order.status}
+                    </span>
+                  </td>
+                  <td className="px-4 py-3">
+                    <div className="text-xs text-white/60">
+                      {order.date.toLocaleDateString()}
+                    </div>
+                  </td>
+                  <td className="px-4 py-3 text-center">
+                    <div className="flex items-center justify-center gap-3">
+                      <Link
+                        href={`/dashboard/orders/${order.id}`}
+                        className="text-primary hover:text-primary-dark font-medium text-xs"
+                      >
+                        View Details
+                      </Link>
+                      {userRole === 'admin' && (
+                        <button
+                          onClick={() => handleDeleteClick(order)}
+                          disabled={deletingOrderId === order.id}
+                          className="text-red-600 hover:text-red-700 font-medium text-xs disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                          title="Delete order"
+                        >
+                          {deletingOrderId === order.id ? (
+                            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-red-600"></div>
+                          ) : (
+                            <svg
+                              className="w-4 h-4"
+                              fill="none"
+                              stroke="currentColor"
+                              viewBox="0 0 24 24"
+                            >
+                              <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth={2}
+                                d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+                              />
+                            </svg>
+                          )}
+                        </button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Delete Confirmation Modal */}
+      {showDeleteModal && orderToDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="glass-strong max-w-md w-full p-6 animate-in zoom-in-95 duration-300">
+            <div className="flex items-center gap-4 mb-6">
+              <div className="w-12 h-12 bg-red-500/20 rounded-full flex items-center justify-center flex-shrink-0">
+                <svg
+                  className="w-6 h-6 text-red-600"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
+                  />
+                </svg>
+              </div>
+              <div>
+                <h3 className="text-lg font-bold text-white">Delete Order</h3>
+                <p className="text-sm text-white/60 mt-1">
+                  This action cannot be undone
+                </p>
+              </div>
+            </div>
+
+            <div className="bg-black/20 rounded-lg p-4 mb-6">
+              <div className="space-y-2 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-white/60">Order ID:</span>
+                  <span className="font-semibold text-white">
+                    {orderToDelete.order_number || orderToDelete.id.slice(0, 8)}...
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-white/60">Customer:</span>
+                  <span className="font-semibold text-white">
+                    {orderToDelete.customer}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-white/60">Amount:</span>
+                  <span className="font-semibold text-white">
+                    KES {(orderToDelete.amount || 0).toLocaleString()}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-white/60">Status:</span>
+                  <span className="font-semibold text-white capitalize">
+                    {orderToDelete.status}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <p className="text-sm text-white/70 mb-6">
+              Are you sure you want to delete this order? All associated order items will also be deleted. This action cannot be undone.
+            </p>
+
+            <div className="flex gap-3">
+              <button
+                onClick={handleDeleteCancel}
+                disabled={deletingOrderId !== null}
+                className="flex-1 px-4 py-3 border border-white/20 text-white/70 rounded-xl font-semibold hover:bg-white/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDeleteConfirm}
+                disabled={deletingOrderId !== null}
+                className="flex-1 px-4 py-3 bg-red-600 text-white rounded-xl font-semibold hover:bg-red-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {deletingOrderId ? 'Deleting...' : 'Delete Order'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Delete Confirmation Modal */}
+      {showBulkDeleteModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
+          <div className="glass-strong max-w-md w-full p-6">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="flex items-center justify-center w-12 h-12 rounded-full bg-red-500/20 flex-shrink-0">
+                <svg className="w-6 h-6 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="text-lg font-bold text-white">Delete {selectedOrderIds.size} Order{selectedOrderIds.size !== 1 ? 's' : ''}</h3>
+                <p className="text-sm text-white/50">This action cannot be undone</p>
+              </div>
+            </div>
+
+            <p className="text-sm text-white/70 mb-6">
+              You are about to permanently delete <strong>{selectedOrderIds.size} order{selectedOrderIds.size !== 1 ? 's' : ''}</strong>. All associated order items will also be deleted.
+            </p>
+
+            <div className="flex gap-3">
+              <button
+                onClick={() => setShowBulkDeleteModal(false)}
+                disabled={isBulkDeleting}
+                className="flex-1 px-4 py-2.5 border border-white/20 text-white/70 rounded-xl font-semibold hover:bg-white/10 transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleBulkDeleteConfirm}
+                disabled={isBulkDeleting}
+                className="flex-1 px-4 py-2.5 bg-red-600 text-white rounded-xl font-semibold hover:bg-red-700 transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+              >
+                {isBulkDeleting ? (
+                  <>
+                    <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                    Deleting...
+                  </>
+                ) : (
+                  `Delete ${selectedOrderIds.size} Order${selectedOrderIds.size !== 1 ? 's' : ''}`
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+

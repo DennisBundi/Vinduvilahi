@@ -1,0 +1,596 @@
+import { createAdminClient } from '@/lib/supabase/admin';
+import { logger } from '@/lib/logger';
+import type { Inventory } from '@/types';
+
+export class InventoryService {
+  /**
+   * Get current stock for a product
+   * Aggregates stock from both inventory (general) and product_sizes (size-based) tables
+   */
+  static async getStock(productId: string): Promise<number> {
+    const adminClient = createAdminClient();
+
+    // Fetch general inventory and size-based inventory in parallel
+    const [inventoryResult, sizeResult] = await Promise.all([
+      adminClient
+        .from('inventory')
+        .select('stock_quantity, reserved_quantity')
+        .eq('product_id', productId)
+        .single(),
+      adminClient
+        .from('product_sizes')
+        .select('stock_quantity, reserved_quantity')
+        .eq('product_id', productId),
+    ]);
+
+    const { data: inventoryData, error: inventoryError } = inventoryResult;
+    const { data: sizeData, error: sizeError } = sizeResult;
+
+    let generalStock = 0;
+    let generalReserved = 0;
+    if (!inventoryError && inventoryData) {
+      generalStock = inventoryData.stock_quantity || 0;
+      generalReserved = inventoryData.reserved_quantity || 0;
+    }
+
+    let sizeStock = 0;
+    let sizeReserved = 0;
+    if (!sizeError && sizeData) {
+      sizeStock = sizeData.reduce((sum, item) => sum + (item.stock_quantity || 0), 0);
+      sizeReserved = sizeData.reduce((sum, item) => sum + (item.reserved_quantity || 0), 0);
+    }
+
+    // Total available stock = (general stock + size stock) - (general reserved + size reserved)
+    const totalStock = generalStock + sizeStock;
+    const totalReserved = generalReserved + sizeReserved;
+
+    return Math.max(0, totalStock - totalReserved);
+  }
+
+  /**
+   * Reserve stock (for pending orders)
+   */
+  static async reserveStock(
+    productId: string,
+    quantity: number
+  ): Promise<boolean> {
+    const adminClient = createAdminClient();
+
+    // Try the RPC function first (checks general inventory table)
+    const { data, error } = await adminClient.rpc('reserve_inventory', {
+      p_product_id: productId,
+      p_quantity: quantity,
+    });
+
+    if (!error && data) {
+      return true;
+    }
+
+    // RPC failed or returned false — check size-based inventory as fallback
+    logger.info(`General inventory reserve failed for ${productId}, checking size-based stock...`);
+
+    const { data: sizeData, error: sizeError } = await adminClient
+      .from('product_sizes')
+      .select('stock_quantity, reserved_quantity')
+      .eq('product_id', productId);
+
+    if (sizeError || !sizeData || sizeData.length === 0) {
+      logger.error('Stock reservation error: no inventory found in general or size tables');
+      return false;
+    }
+
+    const totalAvailable = sizeData.reduce(
+      (sum, item) => sum + Math.max(0, (item.stock_quantity || 0) - (item.reserved_quantity || 0)),
+      0
+    );
+
+    if (totalAvailable < quantity) {
+      logger.error(`Insufficient size-based stock. Available: ${totalAvailable}, Requested: ${quantity}`);
+      return false;
+    }
+
+    // Stock is available across sizes — allow the reservation
+    // Note: We don't increment reserved_quantity on product_sizes here because
+    // the payment flow will call deductStock which handles size-based deduction
+    return true;
+  }
+
+  /**
+   * Release reserved stock (for cancelled orders)
+   */
+  static async releaseStock(
+    productId: string,
+    quantity: number
+  ): Promise<boolean> {
+    const adminClient = createAdminClient();
+
+    const { data, error } = await adminClient.rpc('release_inventory', {
+      p_product_id: productId,
+      p_quantity: quantity,
+    });
+
+    if (error) {
+      // If release fails (e.g., no general inventory row), that's OK —
+      // the reservation was logical only (size-based fallback path)
+      logger.info('Stock release via RPC skipped (no general inventory row):', error.message);
+      return true;
+    }
+
+    return data;
+  }
+
+  /**
+   * Deduct stock atomically (for completed sales)
+   * This is critical for POS and online sales synchronization
+   * Handles general inventory, size-based inventory, and color-based inventory
+   * Priority: size+color > color only > size only > general inventory
+   */
+  static async deductStock(
+    productId: string,
+    quantity: number,
+    sellerId?: string,
+    size?: string,
+    color?: string
+  ): Promise<boolean> {
+    const adminClient = createAdminClient();
+
+    // Helper: also decrement general inventory if it exists, to keep display in sync
+    const decrementGeneralInventory = async () => {
+      const { data: inventoryData, error: inventoryError } = await adminClient
+        .from('inventory')
+        .select('stock_quantity, reserved_quantity')
+        .eq('product_id', productId)
+        .single();
+
+      if (inventoryError || !inventoryData) {
+        logger.info(`General inventory not found or error for product ${productId}:`, inventoryError?.message);
+        return false;
+      }
+
+      const newStock = Math.max(0, (inventoryData.stock_quantity || 0) - quantity);
+      const newReserved = Math.max(0, (inventoryData.reserved_quantity || 0) - quantity);
+
+      const { data: updateResult, error: updateError } = await adminClient
+        .from('inventory')
+        .update({
+          stock_quantity: newStock,
+          reserved_quantity: newReserved,
+          last_updated: new Date().toISOString(),
+        })
+        .eq('product_id', productId)
+        .select();
+
+      if (updateError || !updateResult || updateResult.length === 0) {
+        logger.error('Failed to decrement general inventory after size/color deduction:', updateError);
+        return false;
+      }
+
+      logger.info('General inventory synced after size/color deduction', {
+        productId,
+        old_stock: inventoryData.stock_quantity,
+        new_stock: newStock,
+      });
+      return true;
+    };
+
+    // Priority 1: If both size and color are specified, check product_size_colors
+    if (size && color) {
+      const { data: colorSizeRecord, error: colorSizeError } = await adminClient
+        .from('product_size_colors')
+        .select('id, stock_quantity, reserved_quantity')
+        .eq('product_id', productId)
+        .eq('size', size)
+        .eq('color', color)
+        .single();
+
+      if (!colorSizeError && colorSizeRecord) {
+        const availableStock = Math.max(0, (colorSizeRecord.stock_quantity || 0) - (colorSizeRecord.reserved_quantity || 0));
+        
+        if (availableStock >= quantity) {
+          const { error: updateError } = await adminClient
+            .from('product_size_colors')
+            .update({
+              stock_quantity: (colorSizeRecord.stock_quantity || 0) - quantity,
+              reserved_quantity: Math.max(0, (colorSizeRecord.reserved_quantity || 0) - quantity),
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', colorSizeRecord.id)
+            .gte('stock_quantity', quantity);
+
+          if (!updateError) {
+            logger.info(`Successfully deducted ${quantity} from size+color inventory (${size}, ${color})`);
+            // Keep product_sizes in sync (frontend reads this for "M (5 available)" display)
+            const { data: sizeRow } = await adminClient
+              .from('product_sizes')
+              .select('id, stock_quantity, reserved_quantity')
+              .eq('product_id', productId)
+              .eq('size', size)
+              .single();
+            if (sizeRow) {
+              await adminClient
+                .from('product_sizes')
+                .update({
+                  stock_quantity: Math.max(0, (sizeRow.stock_quantity || 0) - quantity),
+                  reserved_quantity: Math.max(0, (sizeRow.reserved_quantity || 0) - quantity),
+                  last_updated: new Date().toISOString(),
+                })
+                .eq('id', sizeRow.id);
+            }
+            // Keep general inventory in sync if it exists
+            await decrementGeneralInventory();
+            return true;
+          } else {
+            logger.error('Error deducting from size+color inventory:', updateError);
+            // Fall through to try fallback sources
+          }
+        } else {
+          logger.error(`Insufficient stock in size+color inventory. Available: ${availableStock}, Requested: ${quantity}`);
+          // Fall through to try fallback sources
+        }
+      } else {
+        // Size+color combination doesn't exist, try fallback sources
+        logger.info(`Size+color combination (${size}, ${color}) not found, trying fallback sources...`);
+      }
+      
+      // Fallback 1: Try size-only inventory
+      const { data: sizeRecord } = await adminClient
+        .from('product_sizes')
+        .select('id, stock_quantity, reserved_quantity')
+        .eq('product_id', productId)
+        .eq('size', size)
+        .single();
+      
+      if (sizeRecord) {
+        const availableStock = Math.max(0, (sizeRecord.stock_quantity || 0) - (sizeRecord.reserved_quantity || 0));
+        
+        if (availableStock >= quantity) {
+          const { error: updateError } = await adminClient
+            .from('product_sizes')
+            .update({
+              stock_quantity: (sizeRecord.stock_quantity || 0) - quantity,
+              reserved_quantity: Math.max(0, (sizeRecord.reserved_quantity || 0) - quantity),
+              last_updated: new Date().toISOString(),
+            })
+            .eq('id', sizeRecord.id)
+            .gte('stock_quantity', quantity);
+
+          if (!updateError) {
+            logger.info(`Successfully deducted ${quantity} from size-only inventory (${size}) as fallback`);
+            // Keep general inventory in sync if it exists
+            await decrementGeneralInventory();
+            return true;
+          } else {
+            logger.error('Error deducting from size-only inventory:', updateError);
+          }
+        } else {
+          logger.error(`Insufficient stock in size-only inventory. Available: ${availableStock}, Requested: ${quantity}`);
+        }
+      }
+      
+      // Fallback 2: Try color-only inventory
+      const { data: colorRecord } = await adminClient
+        .from('product_size_colors')
+        .select('id, stock_quantity, reserved_quantity')
+        .eq('product_id', productId)
+        .eq('color', color)
+        .is('size', null)
+        .single();
+      
+      if (colorRecord) {
+        const availableStock = Math.max(0, (colorRecord.stock_quantity || 0) - (colorRecord.reserved_quantity || 0));
+        
+        if (availableStock >= quantity) {
+          const { error: updateError } = await adminClient
+            .from('product_size_colors')
+            .update({
+              stock_quantity: (colorRecord.stock_quantity || 0) - quantity,
+              reserved_quantity: Math.max(0, (colorRecord.reserved_quantity || 0) - quantity),
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', colorRecord.id)
+            .gte('stock_quantity', quantity);
+
+          if (!updateError) {
+            logger.info(`Successfully deducted ${quantity} from color-only inventory (${color}) as fallback`);
+            // Keep general inventory in sync if it exists
+            await decrementGeneralInventory();
+            return true;
+          } else {
+            logger.error('Error deducting from color-only inventory:', updateError);
+          }
+        } else {
+          logger.error(`Insufficient stock in color-only inventory. Available: ${availableStock}, Requested: ${quantity}`);
+        }
+      }
+      
+      // Fall through to general inventory (Priority 4) - don't return false here
+      // Let it continue to try general inventory
+      logger.info(`All size+color fallbacks failed, trying general inventory...`);
+    }
+
+    // Priority 2: If only color is specified (no size), check product_size_colors with NULL size
+    if (color && !size) {
+      const { data: colorRecord, error: colorError } = await adminClient
+        .from('product_size_colors')
+        .select('id, stock_quantity, reserved_quantity')
+        .eq('product_id', productId)
+        .eq('color', color)
+        .is('size', null)
+        .single();
+
+      if (!colorError && colorRecord) {
+        const availableStock = Math.max(0, (colorRecord.stock_quantity || 0) - (colorRecord.reserved_quantity || 0));
+        
+        if (availableStock >= quantity) {
+          const { error: updateError } = await adminClient
+            .from('product_size_colors')
+            .update({
+              stock_quantity: (colorRecord.stock_quantity || 0) - quantity,
+              reserved_quantity: Math.max(0, (colorRecord.reserved_quantity || 0) - quantity),
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', colorRecord.id)
+            .gte('stock_quantity', quantity);
+
+          if (!updateError) {
+            logger.info(`Successfully deducted ${quantity} from color-only inventory (${color})`);
+            // Keep general inventory in sync if it exists
+            await decrementGeneralInventory();
+            return true;
+          } else {
+            logger.error('Error deducting from color-only inventory:', updateError);
+          }
+        } else {
+          logger.error(`Insufficient stock in color-only inventory. Available: ${availableStock}, Requested: ${quantity}`);
+          return false;
+        }
+      }
+    }
+
+    // Priority 3: If only size is specified (no color), check product_sizes (existing logic)
+    if (size && !color) {
+      const { data: sizeRecord, error: sizeCheckError } = await adminClient
+        .from('product_sizes')
+        .select('id, stock_quantity, reserved_quantity')
+        .eq('product_id', productId)
+        .eq('size', size)
+        .single();
+
+      if (!sizeCheckError && sizeRecord) {
+        const availableStock = Math.max(0, (sizeRecord.stock_quantity || 0) - (sizeRecord.reserved_quantity || 0));
+        
+        if (availableStock >= quantity) {
+          const { error: updateError } = await adminClient
+            .from('product_sizes')
+            .update({
+              stock_quantity: (sizeRecord.stock_quantity || 0) - quantity,
+              reserved_quantity: Math.max(0, (sizeRecord.reserved_quantity || 0) - quantity),
+              last_updated: new Date().toISOString(),
+            })
+            .eq('id', sizeRecord.id)
+            .gte('stock_quantity', quantity);
+
+          if (!updateError) {
+            logger.info(`Successfully deducted ${quantity} from size-only inventory (${size})`);
+            return true;
+          } else {
+            logger.error('Error deducting from size-only inventory:', updateError);
+          }
+        } else {
+          logger.error(`Insufficient stock in size-only inventory. Available: ${availableStock}, Requested: ${quantity}`);
+          return false;
+        }
+      }
+    }
+
+    // Priority 4: Fall back to general inventory (existing logic)
+    // First, check if we have general inventory
+    logger.info(`Checking general inventory for product ${productId}...`);
+    const { data: inventoryData, error: inventoryCheckError } = await adminClient
+      .from('inventory')
+      .select('stock_quantity, reserved_quantity')
+      .eq('product_id', productId)
+      .single();
+
+    if (inventoryCheckError) {
+      logger.info(`General inventory check error (may not exist):`, inventoryCheckError.message);
+    }
+
+    // If general inventory exists and has stock, try to deduct from it
+    if (!inventoryCheckError && inventoryData) {
+      const availableGeneralStock = Math.max(0, (inventoryData.stock_quantity || 0) - (inventoryData.reserved_quantity || 0));
+      logger.info(`General inventory found: stock=${inventoryData.stock_quantity}, reserved=${inventoryData.reserved_quantity}, available=${availableGeneralStock}, requested=${quantity}`);
+      
+      if (availableGeneralStock >= quantity) {
+        // Try to deduct from general inventory using the database function
+        logger.info(`Attempting to deduct ${quantity} from general inventory using RPC function...`);
+        const { data: generalResult, error: generalError } = await adminClient.rpc('deduct_inventory', {
+          p_product_id: productId,
+          p_quantity: quantity,
+        });
+
+        if (generalError) {
+          logger.error('Error calling deduct_inventory function:', generalError);
+          // Fall through to try direct update
+        } else if (generalResult) {
+          logger.info('Successfully deducted from general inventory via RPC function');
+          return true;
+        } else {
+          logger.info('RPC function returned false/null, trying direct update...');
+        }
+
+        // If function failed, try direct update as fallback using admin client to bypass RLS
+        logger.info(`Attempting direct update of general inventory...`);
+        const newStockQuantity = Math.max(0, (inventoryData.stock_quantity || 0) - quantity);
+        const newReservedQuantity = Math.max(0, (inventoryData.reserved_quantity || 0) - quantity);
+        logger.info(`Updating inventory: ${inventoryData.stock_quantity} -> ${newStockQuantity}, reserved: ${inventoryData.reserved_quantity} -> ${newReservedQuantity}`);
+        
+        const adminClient = createAdminClient();
+        const { data: updateResult, error: directUpdateError } = await adminClient
+          .from('inventory')
+          .update({
+            stock_quantity: newStockQuantity,
+            reserved_quantity: newReservedQuantity,
+            last_updated: new Date().toISOString(),
+          })
+          .eq('product_id', productId)
+          .select();
+
+        if (!directUpdateError && updateResult && updateResult.length > 0) {
+          logger.info('Successfully deducted from general inventory (direct update with admin client)', {
+            updated_record: updateResult[0],
+            old_stock: inventoryData.stock_quantity,
+            new_stock: newStockQuantity
+          });
+          return true;
+        } else {
+          logger.error('Direct update failed:', directUpdateError, { updateResult });
+          return false;
+        }
+      } else {
+        logger.error(`Insufficient stock in general inventory. Available: ${availableGeneralStock}, Requested: ${quantity}`);
+      }
+    } else {
+      logger.info(`No general inventory found for product ${productId}`);
+    }
+
+    // If general inventory doesn't exist or doesn't have enough stock,
+    // try to deduct from size-based inventory
+    const { data: sizeRecords, error: sizeError } = await adminClient
+      .from('product_sizes')
+      .select('id, size, stock_quantity, reserved_quantity')
+      .eq('product_id', productId)
+      .order('stock_quantity', { ascending: false }); // Start with sizes that have most stock
+
+    if (sizeError) {
+      logger.error('Error fetching size records:', sizeError);
+    }
+
+    if (!sizeRecords || sizeRecords.length === 0) {
+      logger.error('No inventory found in general or size-based tables for product:', productId);
+      return false;
+    }
+
+    // Calculate total available size stock
+    const totalSizeStock = sizeRecords.reduce(
+      (sum, record) => sum + Math.max(0, (record.stock_quantity || 0) - (record.reserved_quantity || 0)),
+      0
+    );
+
+    if (totalSizeStock < quantity) {
+      logger.error(`Insufficient stock in size-based inventory. Available: ${totalSizeStock}, Requested: ${quantity}`);
+      return false;
+    }
+
+    // Deduct from size records, starting with the ones that have the most stock
+    let remainingQuantity = quantity;
+    for (const sizeRecord of sizeRecords) {
+      if (remainingQuantity <= 0) break;
+
+      const availableStock = Math.max(0, (sizeRecord.stock_quantity || 0) - (sizeRecord.reserved_quantity || 0));
+      const deductFromThisSize = Math.min(remainingQuantity, availableStock);
+
+      if (deductFromThisSize > 0) {
+        // Use admin client to bypass RLS for size-based inventory updates
+        const adminClient = createAdminClient();
+        const { error: updateError } = await adminClient
+          .from('product_sizes')
+          .update({
+            stock_quantity: (sizeRecord.stock_quantity || 0) - deductFromThisSize,
+            reserved_quantity: Math.max(0, (sizeRecord.reserved_quantity || 0) - deductFromThisSize),
+            last_updated: new Date().toISOString(),
+          })
+          .eq('id', sizeRecord.id);
+
+        if (updateError) {
+          logger.error(`Error deducting from size ${sizeRecord.size}:`, updateError);
+          return false;
+        }
+
+        logger.info(`Deducted ${deductFromThisSize} from size ${sizeRecord.size}`);
+        remainingQuantity -= deductFromThisSize;
+      }
+    }
+
+    // If we still have remaining quantity, it means we couldn't deduct enough
+    if (remainingQuantity > 0) {
+      logger.error(`Could not deduct full quantity from size-based inventory. Remaining: ${remainingQuantity}`);
+      return false;
+    }
+
+    logger.info('Successfully deducted from size-based inventory');
+    return true;
+  }
+
+  /**
+   * Get inventory for multiple products
+   */
+  static async getBulkStock(productIds: string[]): Promise<Record<string, number>> {
+    const adminClient = createAdminClient();
+
+    const { data, error } = await adminClient
+      .from('inventory')
+      .select('product_id, stock_quantity, reserved_quantity')
+      .in('product_id', productIds);
+
+    if (error || !data) {
+      return {};
+    }
+
+    const stockMap: Record<string, number> = {};
+    data.forEach((item) => {
+      stockMap[item.product_id] = item.stock_quantity - item.reserved_quantity;
+    });
+
+    return stockMap;
+  }
+
+  /**
+   * Initialize inventory for a new product
+   */
+  static async initializeInventory(
+    productId: string,
+    initialStock: number = 0
+  ): Promise<boolean> {
+    const adminClient = createAdminClient();
+
+    const { error } = await adminClient.from('inventory').insert({
+      product_id: productId,
+      stock_quantity: initialStock,
+      reserved_quantity: 0,
+    });
+
+    if (error) {
+      logger.error('Inventory initialization error:', error);
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Update inventory stock quantity
+   */
+  static async updateStock(
+    productId: string,
+    newStock: number
+  ): Promise<boolean> {
+    const adminClient = createAdminClient();
+
+    const { error } = await adminClient
+      .from('inventory')
+      .update({
+        stock_quantity: newStock,
+        last_updated: new Date().toISOString(),
+      })
+      .eq('product_id', productId);
+
+    if (error) {
+      logger.error('Stock update error:', error);
+      return false;
+    }
+
+    return true;
+  }
+}
+

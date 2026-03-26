@@ -1,0 +1,814 @@
+"use client";
+
+import { useState } from "react";
+import Image from "next/image";
+import { useCartStore, type ExtendedProduct } from "@/store/cartStore";
+import { useRouter } from "next/navigation";
+import { formatOrderId } from "@/lib/utils/orderId";
+
+const NAIROBI_UTC_OFFSET_HOURS = 3;
+
+interface POSCartProps {
+  employeeId?: string;
+  employeeCode?: string;
+  onOrderComplete?: () => void;
+}
+
+export default function POSCart({
+  employeeId,
+  employeeCode,
+  onOrderComplete,
+}: POSCartProps) {
+  const router = useRouter();
+  const items = useCartStore((state) => state.items);
+  const getTotal = useCartStore((state) => state.getTotal);
+  const clearCart = useCartStore((state) => state.clearCart);
+  const removeItem = useCartStore((state) => state.removeItem);
+  const updateQuantity = useCartStore((state) => state.updateQuantity);
+  const updateSize = useCartStore((state) => state.updateSize);
+  const updateColor = useCartStore((state) => state.updateColor);
+  const updateSalePrice = useCartStore((state) => state.updateSalePrice);
+  const [processing, setProcessing] = useState(false);
+  const [editingItem, setEditingItem] = useState<string | null>(null);
+  const [editingSize, setEditingSize] = useState<string>("");
+  const [editingColor, setEditingColor] = useState<string>("");
+  const [editingSalePrice, setEditingSalePrice] = useState<{
+    [productId: string]: string;
+  }>({});
+  const [availableSizes, setAvailableSizes] = useState<
+    Array<{ size: string; available: number }>
+  >([]);
+  const [paymentMethod, setPaymentMethod] = useState<"cash" | "mpesa" | "card">(
+    "cash"
+  );
+  const [socialPlatform, setSocialPlatform] = useState<
+    "tiktok" | "instagram" | "whatsapp" | "walkin" | ""
+  >("");
+  const [customerName, setCustomerName] = useState("");
+  const [saleDateTime, setSaleDateTime] = useState("");
+  const [showSuccessModal, setShowSuccessModal] = useState(false);
+  const [orderId, setOrderId] = useState<string | null>(null);
+  const [saleDetails, setSaleDetails] = useState<{
+    total: number;
+    paymentMethod: string;
+    itemsCount: number;
+  } | null>(null);
+
+  const total = getTotal();
+
+  const toNairobiIso = (dateTimeLocal: string) => {
+    const [datePart, timePart] = dateTimeLocal.split("T");
+    if (!datePart || !timePart) {
+      return null;
+    }
+    const [year, month, day] = datePart.split("-").map(Number);
+    const [hour, minute] = timePart.split(":").map(Number);
+    if (!year || !month || !day || Number.isNaN(hour) || Number.isNaN(minute)) {
+      return null;
+    }
+    const utcDate = new Date(
+      Date.UTC(year, month - 1, day, hour - NAIROBI_UTC_OFFSET_HOURS, minute)
+    );
+    return utcDate.toISOString();
+  };
+
+  const handleCompleteSale = async () => {
+    if (items.length === 0) {
+      alert("Cart is empty. Please add products to complete a sale.");
+      return;
+    }
+
+    // Validate payment method is selected
+    if (!paymentMethod) {
+      alert("Please select a payment method before completing the sale.");
+      return;
+    }
+
+    // Validate social platform is selected
+    if (!socialPlatform) {
+      alert("Please select a social platform before completing the sale.");
+      return;
+    }
+
+    setProcessing(true);
+
+    try {
+      const saleDateIso = saleDateTime ? toNairobiIso(saleDateTime) : null;
+      if (saleDateTime && !saleDateIso) {
+        alert("Invalid sale date/time. Please select a valid date.");
+        setProcessing(false);
+        return;
+      }
+
+      const hasDatabase =
+        process.env.NEXT_PUBLIC_SUPABASE_URL &&
+        process.env.NEXT_PUBLIC_SUPABASE_URL !== "placeholder";
+
+      if (!hasDatabase) {
+        // Preview mode - simulate successful sale
+        const mockOrderId = `POS-${Date.now()}`;
+        setOrderId(mockOrderId);
+        setSaleDetails({
+          total,
+          paymentMethod: paymentMethod.toUpperCase(),
+          itemsCount: items.length,
+        });
+        setShowSuccessModal(true);
+        clearCart();
+        setCustomerName("");
+        setSaleDateTime("");
+        setPaymentMethod("cash");
+        setSocialPlatform("");
+
+        setProcessing(false);
+        return;
+      }
+
+      // Step 1: Create order
+      // Separate existing products and custom products
+      const existingProductItems: Array<{
+        product_id: string;
+        quantity: number;
+        price: number;
+      }> = [];
+      const customProductItems: Array<{
+        product_data: {
+          name: string;
+          price: number;
+          size?: string;
+          category_id?: string | null;
+          description?: string | null;
+        };
+        quantity: number;
+        price: number;
+      }> = [];
+
+      items.forEach((item) => {
+        const extendedProduct = item.product as ExtendedProduct;
+        const isCustom = extendedProduct.isCustom === true;
+
+        // Use salePrice if set (for discounts), otherwise use product price
+        const basePrice = item.salePrice ?? item.product.price;
+        const price =
+          typeof basePrice === "number"
+            ? basePrice
+            : parseFloat(String(basePrice));
+
+        if (isNaN(price) || price <= 0) {
+          throw new Error(`Invalid price for ${item.product.name}`);
+        }
+
+        // Ensure quantity is a positive integer
+        const quantity = Math.floor(Number(item.quantity));
+        if (quantity <= 0 || !Number.isInteger(quantity)) {
+          throw new Error(`Invalid quantity for ${item.product.name}`);
+        }
+
+        if (isCustom && extendedProduct.customData) {
+          // Custom product - send product_data
+          // Use salePrice if set (for discounts), otherwise use customData.price
+          const customPrice =
+            item.salePrice ?? extendedProduct.customData.price;
+          customProductItems.push({
+            product_data: {
+              name: extendedProduct.customData.name,
+              price: customPrice, // Use discounted price if set
+              size: extendedProduct.customData.size,
+              category_id: extendedProduct.customData.category_id || null,
+              description: extendedProduct.customData.description || null,
+              images: (extendedProduct.customData as any).images || [], // Include images from custom product
+            } as any,
+            quantity: quantity,
+            price: customPrice, // Use discounted price if set
+          });
+        } else {
+          // Existing product - validate UUID and send product_id
+          if (!item.product.id || typeof item.product.id !== "string") {
+            throw new Error(`Invalid product ID for ${item.product.name}`);
+          }
+
+          // Validate UUID format (basic check)
+          const uuidRegex =
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+          if (!uuidRegex.test(item.product.id)) {
+            console.error("Invalid UUID format for product:", item.product);
+            throw new Error(
+              `Product "${item.product.name}" has an invalid ID format. Please refresh the page and try again.`
+            );
+          }
+
+          existingProductItems.push({
+            product_id: item.product.id,
+            quantity: quantity,
+            price: price,
+            size: item.size || undefined,
+            color: item.color || undefined,
+          } as any);
+        }
+      });
+
+      // Combine items (existing products with product_id, custom products with product_data)
+      const orderItems = [...existingProductItems, ...customProductItems];
+
+      // Log the order data for debugging
+      console.log("Creating order with items:", {
+        existing: existingProductItems.length,
+        custom: customProductItems.length,
+        total: orderItems.length,
+      });
+
+      // Prepare order data with seller_id if available
+      const orderData: any = {
+        items: orderItems,
+        customer_info: {
+          name: customerName || "POS Customer",
+          email: "pos@vinduvilahi.com",
+          phone: "0000000000",
+          address: "In-store",
+        },
+        sale_type: "pos",
+        social_platform: socialPlatform, // Include social platform
+        sale_datetime: saleDateIso || undefined,
+      };
+
+      // Include seller_id if employeeId is a valid UUID
+      if (
+        employeeId &&
+        typeof employeeId === "string" &&
+        employeeId.trim() !== ""
+      ) {
+        const uuidRegex =
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (uuidRegex.test(employeeId)) {
+          orderData.seller_id = employeeId;
+        }
+      }
+
+      const orderResponse = await fetch("/api/orders/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(orderData),
+      });
+
+      if (!orderResponse.ok) {
+        const errorData = await orderResponse.json().catch(() => ({}));
+        // Show detailed validation errors if available
+        const errorMessage = errorData.details
+          ? `Validation Error: ${JSON.stringify(errorData.details, null, 2)}`
+          : errorData.error || "Failed to create order";
+        throw new Error(errorMessage);
+      }
+
+      const { order_id } = await orderResponse.json();
+
+      // Step 2: Update order with seller_id and payment method
+      // Prepare update data - only include seller_id if it's a valid UUID
+      // All payment methods are marked as completed since transactions are confirmed at physical POS
+      const updateData: any = {
+        order_id,
+        payment_method: paymentMethod,
+        status: "completed", // All POS payments are completed immediately at physical location
+      };
+
+      // Include social platform if selected
+      if (socialPlatform && socialPlatform.trim() !== "") {
+        updateData.social_platform = socialPlatform;
+      }
+
+      // Only include seller_id if employeeId is provided and is a valid UUID
+      if (
+        employeeId &&
+        typeof employeeId === "string" &&
+        employeeId.trim() !== ""
+      ) {
+        const uuidRegex =
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (uuidRegex.test(employeeId)) {
+          updateData.seller_id = employeeId;
+        } else {
+          console.warn(
+            "Invalid employeeId format, skipping seller_id:",
+            employeeId
+          );
+        }
+      }
+
+      console.log("Updating order with data:", updateData);
+
+      const updateResponse = await fetch("/api/orders/update", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updateData),
+      });
+
+      // Log warning if update fails, but don't throw - inventory is already deducted server-side for POS orders
+      if (!updateResponse.ok) {
+        const errorData = await updateResponse.json().catch(() => ({}));
+        console.warn(
+          "⚠️ Order update failed (non-critical, inventory already deducted):",
+          errorData.error || "Unknown error"
+        );
+        // Continue to success - inventory was already deducted in /api/orders/create for POS orders
+      }
+
+      // Step 3: Inventory deduction
+      // NOTE: For POS orders, inventory is already deducted server-side in /api/orders/create
+      // So we skip this step for POS orders to avoid double-deduction
+      // Inventory deduction happens automatically when the order is created with sale_type="pos"
+      console.log("✅ Inventory already deducted server-side for POS order");
+
+      // All operations successful - show success modal
+      setOrderId(order_id);
+      setSaleDetails({
+        total,
+        paymentMethod: paymentMethod.toUpperCase(),
+        itemsCount: items.length,
+      });
+      setShowSuccessModal(true);
+      clearCart();
+      setCustomerName("");
+      setSaleDateTime("");
+      setPaymentMethod("cash"); // Reset to default
+      setSocialPlatform(""); // Reset social platform
+
+      // Refresh products to show updated inventory
+      if (onOrderComplete) {
+        onOrderComplete();
+      }
+    } catch (error) {
+      console.error("Error completing sale:", error);
+      alert(
+        error instanceof Error
+          ? error.message
+          : "Failed to complete sale. Please try again."
+      );
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  return (
+    <>
+      {/* Success Modal */}
+      {showSuccessModal && orderId && saleDetails && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="glass-strong rounded-3xl max-w-md w-full p-8 text-center animate-in zoom-in-95 duration-300">
+            {/* Success Icon */}
+            <div className="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-6">
+              <svg
+                className="w-10 h-10 text-green-600"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M5 13l4 4L19 7"
+                />
+              </svg>
+            </div>
+
+            {/* Success Message */}
+            <h3 className="text-2xl font-bold text-white mb-2">
+              Sale Completed Successfully!
+            </h3>
+            <p className="text-white/60 mb-6">
+              Your sale has been recorded and inventory has been updated.
+            </p>
+
+            {/* Sale Details */}
+            <div className="bg-black/20 rounded-xl p-4 mb-6 text-left space-y-2">
+              <div className="flex justify-between">
+                <span className="text-white/60">Order Number:</span>
+                <span className="font-semibold text-white font-mono">
+                  {formatOrderId(orderId)}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-white/60">Items Sold:</span>
+                <span className="font-semibold text-white">
+                  {saleDetails.itemsCount}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-white/60">Payment Method:</span>
+                <span className="font-semibold text-white">
+                  {saleDetails.paymentMethod}
+                </span>
+              </div>
+              <div className="flex justify-between pt-2 border-t border-white/10">
+                <span className="text-lg font-semibold text-white">
+                  Total Amount:
+                </span>
+                <span className="text-lg font-bold text-primary">
+                  KES {(saleDetails.total || 0).toLocaleString()}
+                </span>
+              </div>
+            </div>
+
+            {/* Close Button */}
+            <button
+              onClick={() => {
+                setShowSuccessModal(false);
+                setOrderId(null);
+                setSaleDetails(null);
+              }}
+              className="w-full py-4 px-6 bg-primary text-white rounded-xl font-bold text-lg hover:bg-primary-dark hover:shadow-lg transition-all transform hover:-translate-y-1"
+            >
+              Continue
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div
+        className="glass-card rounded-2xl shadow-lg p-6 sticky top-4"
+        data-pos-cart
+      >
+        <h2 className="text-2xl font-bold mb-6 text-white">Cart</h2>
+
+        {/* Customer Name (Optional) */}
+        {items.length > 0 && (
+          <div className="mb-4">
+            <label className="block text-sm font-semibold text-white/70 mb-2">
+              Customer Name (Optional)
+            </label>
+            <input
+              type="text"
+              value={customerName}
+              onChange={(e) => setCustomerName(e.target.value)}
+              placeholder="Enter customer name..."
+              className="w-full px-4 py-3 bg-white/10 border-2 border-white/20 text-white placeholder:text-white/30 rounded-xl focus:outline-none focus:border-primary focus:ring-2 focus:ring-rose-400/50 transition-all"
+            />
+          </div>
+        )}
+
+        {/* Sale Date/Time (Optional) */}
+        {items.length > 0 && (
+          <div className="mb-4">
+            <label className="block text-sm font-semibold text-white/70 mb-2">
+              Sale Date/Time (Optional)
+            </label>
+            <input
+              type="datetime-local"
+              value={saleDateTime}
+              onChange={(e) => setSaleDateTime(e.target.value)}
+              className="w-full px-4 py-3 bg-white/10 border-2 border-white/20 text-white rounded-xl focus:outline-none focus:border-primary focus:ring-2 focus:ring-rose-400/50 transition-all"
+            />
+            <p className="text-xs text-white/50 mt-1">
+              Timezone: Africa/Nairobi. Leave blank to use current time.
+            </p>
+          </div>
+        )}
+
+        {/* Cart Items */}
+        <div className="space-y-3 mb-6 max-h-96 overflow-y-auto pr-2">
+          {items.length === 0 ? (
+            <div className="text-center py-12">
+              <svg
+                className="w-16 h-16 text-white/20 mx-auto mb-4"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={1.5}
+                  d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z"
+                />
+              </svg>
+              <p className="text-white/50 font-medium">Cart is empty</p>
+              <p className="text-sm text-white/40 mt-1">
+                Add products to start a sale
+              </p>
+            </div>
+          ) : (
+            items.map((item) => (
+              <div
+                key={item.product.id}
+                className="flex gap-3 p-3 bg-black/20 rounded-xl hover:bg-black/30 transition-colors"
+              >
+                <div className="relative w-16 h-16 bg-white/10 rounded-lg overflow-hidden flex-shrink-0">
+                  {item.product.images && item.product.images.length > 0 ? (
+                    <Image
+                      src={item.product.images[0]}
+                      alt={item.product.name}
+                      fill
+                      className="object-cover"
+                      sizes="64px"
+                    />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center text-white/40 text-xs">
+                      <svg
+                        className="w-6 h-6"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={1.5}
+                          d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
+                        />
+                      </svg>
+                    </div>
+                  )}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 mb-1">
+                    <div className="font-semibold text-sm text-white truncate">
+                      {item.product.name}
+                    </div>
+                    {(item.product as ExtendedProduct).isCustom && (
+                      <span className="px-2 py-0.5 bg-blue-100 text-blue-700 text-xs font-semibold rounded-full whitespace-nowrap">
+                        Custom
+                      </span>
+                    )}
+                  </div>
+                  {/* Size and Color Display/Edit */}
+                  {(item.size || item.color) && (
+                    <div className="flex items-center gap-2 mb-2 text-xs">
+                      {item.size && (
+                        <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded font-semibold">
+                          Size: {item.size}
+                        </span>
+                      )}
+                      {item.color && (
+                        <span className="px-2 py-1 bg-purple-100 text-purple-700 rounded font-semibold">
+                          Color: {item.color}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  <div className="flex items-center gap-2 mb-2">
+                    <div className="flex items-center gap-1 bg-white/10 rounded-lg p-1">
+                      <button
+                        onClick={() =>
+                          updateQuantity(item.product.id, item.quantity - 1)
+                        }
+                        className="w-6 h-6 rounded border border-white/20 hover:bg-white/20 text-white/60 flex items-center justify-center text-xs font-semibold"
+                      >
+                        −
+                      </button>
+                      <span className="w-8 text-center text-sm font-semibold">
+                        {item.quantity}
+                      </span>
+                      <button
+                        onClick={() =>
+                          updateQuantity(item.product.id, item.quantity + 1)
+                        }
+                        className="w-6 h-6 rounded border border-white/20 hover:bg-white/20 text-white/60 flex items-center justify-center text-xs font-semibold"
+                      >
+                        +
+                      </button>
+                    </div>
+                    <button
+                      onClick={() => removeItem(item.product.id)}
+                      className="p-1 hover:bg-red-50 rounded text-red-600 transition-colors"
+                      title="Remove"
+                    >
+                      <svg
+                        className="w-4 h-4"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+                        />
+                      </svg>
+                    </button>
+                  </div>
+                  <div className="space-y-1">
+                    {/* Original Price */}
+                    <div
+                      className={`text-xs ${
+                        item.salePrice
+                          ? "line-through text-white/40"
+                          : "text-white/60"
+                      }`}
+                    >
+                      KES {(item.product.price || 0).toLocaleString()} each
+                    </div>
+                    {/* Discount Price Input */}
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        placeholder="Discount price (optional)"
+                        value={
+                          editingSalePrice[item.product.id] ??
+                          (item.salePrice ? item.salePrice.toString() : "")
+                        }
+                        onChange={(e) => {
+                          const value = e.target.value;
+                          setEditingSalePrice((prev) => ({
+                            ...prev,
+                            [item.product.id]: value,
+                          }));
+                        }}
+                        onBlur={(e) => {
+                          const value = e.target.value.trim();
+                          if (value === "") {
+                            // Clear discount - use original price
+                            updateSalePrice(item.product.id, undefined);
+                            setEditingSalePrice((prev) => {
+                              const newState = { ...prev };
+                              delete newState[item.product.id];
+                              return newState;
+                            });
+                          } else {
+                            const numValue = parseFloat(value);
+                            if (!isNaN(numValue) && numValue > 0) {
+                              updateSalePrice(item.product.id, numValue);
+                            } else {
+                              // Invalid value, revert to current salePrice or clear
+                              setEditingSalePrice((prev) => {
+                                const newState = { ...prev };
+                                if (item.salePrice) {
+                                  newState[item.product.id] =
+                                    item.salePrice.toString();
+                                } else {
+                                  delete newState[item.product.id];
+                                }
+                                return newState;
+                              });
+                            }
+                          }
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.currentTarget.blur();
+                          }
+                        }}
+                        className="w-24 px-2 py-1 text-xs bg-white/10 border border-white/20 text-white placeholder:text-white/30 rounded focus:outline-none focus:border-primary focus:ring-1 focus:ring-rose-400/50"
+                      />
+                    </div>
+                    {/* Show discounted price if set */}
+                    {item.salePrice && (
+                      <div className="text-xs font-semibold text-primary">
+                        Discount: KES {item.salePrice.toLocaleString()} each
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="font-bold text-primary text-lg">
+                    KES{" "}
+                    {(
+                      (item.salePrice ?? (item.product.price || 0)) *
+                      item.quantity
+                    ).toLocaleString()}
+                  </div>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+
+        {items.length > 0 && (
+          <>
+            {/* Total */}
+            <div className="border-t-2 border-white/10 pt-4 mb-6">
+              <div className="flex justify-between items-center mb-2">
+                <span className="text-lg font-semibold text-white/70">
+                  Subtotal
+                </span>
+                <span className="text-lg font-semibold text-white">
+                  KES {(total || 0).toLocaleString()}
+                </span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-2xl font-bold text-white">Total</span>
+                <span className="text-3xl font-bold text-primary">
+                  KES {(total || 0).toLocaleString()}
+                </span>
+              </div>
+            </div>
+
+            {/* Social Platform */}
+            <div className="mb-6">
+              <label className="block text-sm font-semibold text-white/70 mb-2">
+                Social Platform <span className="text-red-500">*</span>
+              </label>
+              <select
+                value={socialPlatform}
+                onChange={(e) =>
+                  setSocialPlatform(
+                    e.target.value as
+                      | "tiktok"
+                      | "instagram"
+                      | "whatsapp"
+                      | "walkin"
+                      | ""
+                  )
+                }
+                className="w-full px-4 py-3 bg-white/10 border-2 border-white/20 text-white rounded-xl focus:outline-none focus:border-primary focus:ring-2 focus:ring-rose-400/50 transition-all"
+                required
+              >
+                <option value="">Select platform...</option>
+                <option value="tiktok">TikTok</option>
+                <option value="instagram">Instagram</option>
+                <option value="whatsapp">WhatsApp</option>
+                <option value="walkin">Walk-in</option>
+              </select>
+            </div>
+
+            {/* Payment Method */}
+            <div className="mb-6">
+              <label className="block text-sm font-semibold text-white/70 mb-3">
+                Payment Method <span className="text-red-500">*</span>
+              </label>
+              <div className="grid grid-cols-3 gap-2">
+                <button
+                  onClick={() => setPaymentMethod("cash")}
+                  className={`p-3 rounded-none border-2 font-semibold transition-all ${
+                    paymentMethod === "cash"
+                      ? "border-primary bg-primary/10 text-primary"
+                      : "border-white/20 text-white/70 hover:border-white/40"
+                  }`}
+                >
+                  💵 Cash
+                </button>
+                <button
+                  onClick={() => setPaymentMethod("mpesa")}
+                  className={`p-3 rounded-none border-2 font-semibold transition-all ${
+                    paymentMethod === "mpesa"
+                      ? "border-primary bg-primary/10 text-primary"
+                      : "border-white/20 text-white/70 hover:border-white/40"
+                  }`}
+                >
+                  📱 M-Pesa
+                </button>
+                <button
+                  onClick={() => setPaymentMethod("card")}
+                  className={`p-3 rounded-none border-2 font-semibold transition-all ${
+                    paymentMethod === "card"
+                      ? "border-primary bg-primary/10 text-primary"
+                      : "border-white/20 text-white/70 hover:border-white/40"
+                  }`}
+                >
+                  💳 Card
+                </button>
+              </div>
+            </div>
+
+            {/* Complete Sale Button */}
+            <button
+              onClick={handleCompleteSale}
+              disabled={processing || !socialPlatform}
+              className="w-full py-4 px-6 bg-primary text-white rounded-none font-bold text-lg hover:bg-primary-dark hover:shadow-xl transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100"
+            >
+              {processing ? (
+                <span className="flex items-center justify-center gap-2">
+                  <svg
+                    className="animate-spin h-5 w-5"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                  >
+                    <circle
+                      className="opacity-25"
+                      cx="12"
+                      cy="12"
+                      r="10"
+                      stroke="currentColor"
+                      strokeWidth="4"
+                    ></circle>
+                    <path
+                      className="opacity-75"
+                      fill="currentColor"
+                      d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                    ></path>
+                  </svg>
+                  Processing...
+                </span>
+              ) : (
+                `Complete Sale - KES ${(total || 0).toLocaleString()}`
+              )}
+            </button>
+
+            {/* Employee Info */}
+            {employeeCode && (
+              <div className="mt-4 pt-4 border-t border-white/10 text-center">
+                <p className="text-xs text-white/50">
+                  Sale by:{" "}
+                  <span className="font-semibold text-white/70">
+                    {employeeCode}
+                  </span>
+                </p>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </>
+  );
+}
