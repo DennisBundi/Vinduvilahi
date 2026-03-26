@@ -20,10 +20,10 @@ export default function Footer() {
             <Link href="/" className="inline-block mb-4">
               <Image
                 src="/images/vinduvilahi-logo-white.png"
-                alt="Vindu Vilahi Logo"
-                width={50}
-                height={50}
-                className="h-12 w-12 object-cover rounded-full"
+                alt="Vindu Vilahi"
+                width={200}
+                height={58}
+                className="h-12 w-auto object-contain"
                 unoptimized
               />
             </Link>
