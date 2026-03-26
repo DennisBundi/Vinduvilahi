@@ -3,7 +3,6 @@ import type { Metadata } from "next";
 import ProductGrid from "@/components/products/ProductGrid";
 import FlashSaleCountdown from "@/components/products/FlashSaleCountdown";
 import ReviewSection from "@/components/home/ReviewSection";
-import ImportationSection from "@/components/home/ImportationSection";
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
 
@@ -200,24 +199,17 @@ export default async function HomePage() {
   return (
     <div className="min-h-screen">
       {/* Hero Section */}
-      <section className="relative text-white min-h-[calc(60vh+150px)] flex items-center overflow-hidden">
-        {/* Background image */}
-        <div
-          className="absolute inset-0 bg-cover bg-top bg-no-repeat"
-          style={{ backgroundImage: "url('/images/hero-fashion.jpg')" }}
-        />
-        {/* Dark overlay for text readability */}
-        <div className="absolute inset-0 bg-black/50" />
+      <section className="relative text-white min-h-[calc(60vh+150px)] flex items-center overflow-hidden bg-primary">
 
         <div className="container mx-auto px-4 text-center relative z-10 animate-slide-up w-full py-24 md:py-0">
           <h1 className="text-5xl md:text-7xl font-bold mb-6 tracking-tight">
-            Dress Like You{" "}
+            Unmatched Quality,{" "}
             <span className="bg-white/20 px-4 py-2 rounded-2xl">
-              Mean It
+              Unmistakable Style
             </span>
           </h1>
           <p className="text-xl md:text-2xl mb-10 text-white/90 max-w-2xl mx-auto">
-            Bold, fresh styles for the woman who walks in and owns the room. Shop Nairobi&apos;s go-to fashion destination.
+            Premium fashion crafted for the woman who demands the best. Discover Vindu Vilahi.
           </p>
           <div className="flex flex-col sm:flex-row gap-4 justify-center">
             <Link
@@ -260,7 +252,7 @@ export default async function HomePage() {
 
           {newArrivalsWithStock.length > 0 ? (
             <>
-              <ProductGrid products={newArrivalsWithStock} />
+              <ProductGrid products={newArrivalsWithStock.slice(0, 6)} />
               <div className="text-center mt-12">
                 <Link
                   href="/products"
@@ -438,9 +430,6 @@ export default async function HomePage() {
           </Link>
         </div>
       </section>
-
-      {/* Importation Waitlist Section */}
-      <ImportationSection />
 
       {/* Customer Reviews Section */}
       <ReviewSection />

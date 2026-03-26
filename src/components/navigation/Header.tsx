@@ -275,16 +275,24 @@ export default function Header() {
             href="/"
             className="flex items-center hover:opacity-80 transition-opacity"
           >
-            <div className="h-12 w-12 rounded-full overflow-hidden flex-shrink-0">
-              <Image
-                src="/images/leeztruelogo.jpeg"
-                alt="Leez True Styles Logo"
-                width={60}
-                height={60}
-                className="h-full w-full object-cover scale-[1.45]"
-                priority
-              />
-            </div>
+            {/* Light mode: gold logo */}
+            <Image
+              src="/images/vinduvilahi-logo-gold.png"
+              alt="Vindu Vilahi"
+              width={180}
+              height={52}
+              className="h-11 w-auto object-contain dark:hidden"
+              priority
+            />
+            {/* Dark mode: white logo */}
+            <Image
+              src="/images/vinduvilahi-logo-white.png"
+              alt="Vindu Vilahi"
+              width={180}
+              height={52}
+              className="h-11 w-auto object-contain hidden dark:block"
+              priority
+            />
           </Link>
 
           {/* Desktop Navigation */}
