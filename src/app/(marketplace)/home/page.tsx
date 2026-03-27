@@ -240,13 +240,13 @@ export default async function HomePage() {
                   d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z"
                 />
               </svg>
-              NEW ARRIVALS
+              NEW IN
             </div>
             <h2 className="text-4xl md:text-5xl font-bold mb-4 text-gray-900">
-              Fresh Drops
+              Just Landed
             </h2>
             <p className="text-gray-600 text-lg max-w-2xl mx-auto">
-              New styles every week. Be the first to wear what everyone else wishes they had.
+              The latest additions to Vindu Vilahi — curated for Kenyan women who set the trend, not follow it.
             </p>
           </div>
 
@@ -293,10 +293,10 @@ export default async function HomePage() {
                 </svg>
               </div>
               <h3 className="text-2xl font-semibold text-gray-700 mb-2">
-                No New Arrivals Yet
+                New Styles Coming Soon
               </h3>
               <p className="text-gray-500 mb-8 max-w-md mx-auto">
-                Check back soon for our latest products and fresh styles!
+                Vindu Vilahi is restocking. Check back soon for the latest arrivals.
               </p>
               <Link
                 href="/products"
@@ -349,10 +349,10 @@ export default async function HomePage() {
               FLASH SALE
             </div>
             <h2 className="text-4xl md:text-5xl font-bold mb-4 text-gray-900">
-              Snag It Before It&apos;s Gone
+              Limited Time Offers
             </h2>
             <p className="text-gray-600 text-lg max-w-2xl mx-auto mb-6">
-              These prices won&apos;t last — and neither will the stock.
+              Exclusive Vindu Vilahi deals — premium fashion at unbeatable prices, for a limited time only.
             </p>
 
             {flashSaleWithStock.length > 0 &&
@@ -399,10 +399,10 @@ export default async function HomePage() {
       <section className="container mx-auto px-4 py-16 md:py-24">
         <div className="text-center mb-12 animate-fade-in">
           <h2 className="text-4xl md:text-5xl font-bold mb-4 text-gray-900">
-            Fan Favourites
+            Most Loved
           </h2>
           <p className="text-gray-600 text-lg max-w-2xl mx-auto">
-            The pieces our customers keep coming back for.
+            Vindu Vilahi bestsellers — the styles Kenyan women are choosing, wearing, and loving.
           </p>
         </div>
 
